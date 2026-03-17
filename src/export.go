@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,71 +9,15 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
 )
 
-type userAgentTransport struct {
-	Transport http.RoundTripper
-	UserAgent string
-}
-
-// API Response Structures for HTB Academy 2.0
-type ModuleResponse struct {
-	Data ModuleData `json:"data"`
-}
-
-type ModuleData struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-}
-
-type SectionsResponse struct {
-	Data []SectionGroup `json:"data"`
-}
-
-type SectionGroup struct {
-	Group    string    `json:"group"`
-	Sections []Section `json:"sections"`
-}
-
-type Section struct {
-	ID    int    `json:"id"`
-	Title string `json:"title"`
-	Page  int    `json:"page"`
-}
-
-type SectionContentResponse struct {
-	Data SectionContent `json:"data"`
-}
-
-type SectionContent struct {
-	Content string `json:"content"`
-}
-
 const cdnBase = "https://cdn.services-k8s.prod.aws.htb.systems"
 const academyBase = "https://academy.hackthebox.com"
 
-func authenticateWithCookies(cookies string) *http.Client {
-	client, err := newClient(cookies)
-	if err != nil {
-		die(err)
-	}
-
-	// Validates authentication by checking access to the dashboard
-	resp, err := client.Get(academyBase + "/app/dashboard")
-	if err != nil {
-		die(err)
-	}
-
-	if resp.StatusCode != 200 {
-		fmt.Println("Authentication Failed, refresh your cookies and try again!")
-		os.Exit(1)
-	}
-
-	return client
-}
 
 func (ua *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("User-Agent") == "" {
@@ -81,35 +26,29 @@ func (ua *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	return ua.Transport.RoundTrip(req)
 }
 
-func newClient(cookies string) (*http.Client, error) {
-	// For proxy debugging
-	//proxy, _ := url.Parse("http://localhost:8080")
-	//transport := &userAgentTransport{
-	//	Transport: &http.Transport{
-	//		Proxy:           http.ProxyURL(proxy),
-	//		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	//	},
-	//	UserAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
-	//}
-	transport := &userAgentTransport{
-		Transport: http.DefaultTransport,
-		UserAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
-	}
-	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-	if err != nil {
-		return nil, err
+func createHttpClient(options Args) *http.Client {
+	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if options.cookies != "" {
+		addCookiesToJar(jar, options.cookies)
 	}
 
-	client := &http.Client{
+	var transport http.RoundTripper = http.DefaultTransport
+	if options.proxy {
+		proxyAddr, _ := url.Parse("http://127.0.0.1:8080")
+		transport = &http.Transport{
+			Proxy:           http.ProxyURL(proxyAddr),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+	transport = &userAgentTransport{
+		Transport: transport,
+		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+	}
+
+	return &http.Client{
 		Jar:       jar,
 		Transport: transport,
 	}
-
-	if cookies != "" {
-		addCookiesToJar(jar, cookies)
-	}
-
-	return client, nil
 }
 
 func addCookiesToJar(jar *cookiejar.Jar, cookies string) {
@@ -130,27 +69,94 @@ func addCookiesToJar(jar *cookiejar.Jar, cookies string) {
 	jar.SetCookies(u, cookieList)
 }
 
-func getModule(moduleUrl string, client *http.Client) (string, []string) {
-	// Extract module ID from URL (e.g., https://academy.hackthebox.com/module/163/section/1546)
-	moduleID := extractModuleID(moduleUrl)
+func authenticate(options Args) *http.Client {
+	client := createHttpClient(options)
+	resp, err := client.Get(academyBase + "/api/v2/modules?state=owned")
+	if err != nil {
+		die(fmt.Errorf("authentication failed: %v", err))
+	}
+	defer resp.Body.Close()
 
-	// Normalize URL to use /app/ path format for referer
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		die(fmt.Errorf("authentication failed with status %d: %s", resp.StatusCode, string(body)))
+	}
+
+	return client
+}
+
+func getAllAvailableModules(client *http.Client, tracker *TrackerData) []ModuleData {
+	// Use cached list if available
+	if len(tracker.ModulesAvailable) > 0 {
+		fmt.Printf("Using cached list of %d available modules from tracker.\n", len(tracker.ModulesAvailable))
+		var modules []ModuleData
+		for _, module := range tracker.ModulesAvailable {
+			modules = append(modules, module)
+		}
+		return modules
+	}
+
+	apiUrl := "https://academy.hackthebox.com/api/v2/modules"
+	stateValues := []string{"owned", "in_progress"}
+	var allModules []ModuleData
+
+	for _, state := range stateValues {
+		req, err := http.NewRequest("GET", apiUrl+"?state="+state, nil)
+		if err != nil {
+			die(err)
+		}
+
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Referer", "https://academy.hackthebox.com/app/library/modules")
+		resp, err := client.Do(req)
+		if err != nil {
+			die(err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			die(err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Failed to fetch modules. Status: %d\n", resp.StatusCode)
+			fmt.Println("Response:", string(body))
+			os.Exit(1)
+		}
+
+		var modulesResp ModuleReponseArray
+		if err := json.Unmarshal(body, &modulesResp); err != nil {
+			die(err)
+		}
+
+		for _, module := range modulesResp.Data {
+			allModules = append(allModules, module)
+			tracker.ModulesAvailable = append(tracker.ModulesAvailable, module)
+		}
+	}
+
+	// Cache the fetched list
+	saveTracker(*tracker)
+
+	return allModules
+}
+
+func getModule(moduleUrl string, client *http.Client) (ModuleData, string, []Section, []string) {
+	moduleID := extractModuleID(moduleUrl)
 	refererUrl := normalizeModuleUrl(moduleUrl)
 
-	// Fetch module metadata to get the title
-	moduleTitle := getModuleMetadata(moduleID, refererUrl, client)
+	moduleData, moduleTitle := getModuleMetadata(moduleID, refererUrl, client)
 
-	// Fetch all sections for this module
 	sections := getModuleSections(moduleID, refererUrl, client)
 
-	// Fetch content for each section
 	var pagesContent []string
 	for _, section := range sections {
 		content := getSectionContent(moduleID, section.ID, refererUrl, client)
 		pagesContent = append(pagesContent, content)
 	}
 
-	return moduleTitle, pagesContent
+	return moduleData, moduleTitle, sections, pagesContent
 }
 
 func extractModuleID(moduleUrl string) string {
@@ -177,8 +183,8 @@ func normalizeModuleUrl(moduleUrl string) string {
 	return strings.Replace(moduleUrl, "/module/", "/app/module/", 1)
 }
 
-func getModuleMetadata(moduleID string, refererUrl string, client *http.Client) string {
-	apiUrl := fmt.Sprintf(academyBase+"/api/v2/modules/%s", moduleID)
+func getModuleMetadata(moduleID string, refererUrl string, client *http.Client) (ModuleData, string) {
+	apiUrl := fmt.Sprintf("https://academy.hackthebox.com/api/v2/modules/%s", moduleID)
 
 	req, err := http.NewRequest("GET", apiUrl, nil)
 	if err != nil {
@@ -199,7 +205,7 @@ func getModuleMetadata(moduleID string, refererUrl string, client *http.Client) 
 		die(err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("Failed to fetch module metadata. Status: %d\n", resp.StatusCode)
 		fmt.Println("Response:", string(body))
 		os.Exit(1)
@@ -210,14 +216,7 @@ func getModuleMetadata(moduleID string, refererUrl string, client *http.Client) 
 		die(err)
 	}
 
-	// Clean the title for use as a filename
-	title := moduleResp.Data.Name
-	badChars := []string{"/", "\\", "?", "%", "*", ":", "|", "\"", "<", ">"}
-	for _, badChar := range badChars {
-		title = strings.ReplaceAll(title, badChar, "-")
-	}
-
-	return title
+	return moduleResp.Data, moduleResp.Data.Name
 }
 
 func getModuleSections(moduleID string, refererUrl string, client *http.Client) []Section {
@@ -242,7 +241,7 @@ func getModuleSections(moduleID string, refererUrl string, client *http.Client) 
 		die(err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("Failed to fetch module sections. Status: %d\n", resp.StatusCode)
 		fmt.Println("Response:", string(body))
 		os.Exit(1)
@@ -293,7 +292,7 @@ func getSectionContent(moduleID string, sectionID int, refererUrl string, client
 		die(err)
 	}
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("Failed to fetch section %d. Status: %d\n", sectionID, resp.StatusCode)
 		fmt.Println("Response:", string(body))
 		os.Exit(1)
@@ -311,376 +310,59 @@ func getSectionContent(moduleID string, sectionID int, refererUrl string, client
 	return content
 }
 
-// htmlImageMatch holds the positions and attributes of a parsed <img> tag.
-type htmlImageMatch struct {
-	tagStart int
-	tagEnd   int // index past the closing >
-	src      string
-	alt      string
-}
-
-// extractHtmlImageTags scans content for <img> tags outside of fenced code blocks
-// and returns their positions and parsed src/alt attributes.
-func extractHtmlImageTags(content string) []htmlImageMatch {
-	var matches []htmlImageMatch
-	inFence := false
-	i := 0
-	for i < len(content) {
-		// Track fenced code blocks (``` fences) so we don't mangle example HTML.
-		if i+2 < len(content) && content[i:i+3] == "```" {
-			inFence = !inFence
-			i += 3
-			continue
-		}
-		if inFence {
-			i++
-			continue
-		}
-
-		if !strings.HasPrefix(content[i:], "<img") {
-			i++
-			continue
-		}
-		tagStart := i
-
-		tagEnd := findTagEnd(content, i)
-		if tagEnd == -1 {
-			break
-		}
-		tag := content[tagStart:tagEnd]
-
-		src := extractTagAttr(tag, "src")
-		alt := extractTagAttr(tag, "alt")
-
-		if src != "" {
-			matches = append(matches, htmlImageMatch{tagStart, tagEnd, src, alt})
-		}
-		i = tagEnd
-	}
-	return matches
-}
-
-func findTagEnd(content string, start int) int {
-	i := start + 1 // skip the opening
-	for i < len(content) {
-		ch := content[i]
-		if ch == '>' {
-			return i + 1
-		}
-		// Enter a quoted attribute value — skip everything until the matching quote.
-		if ch == '"' || ch == '\'' {
-			quote := ch
-			i++
-			for i < len(content) && content[i] != quote {
-				i++
-			}
-		}
-		i++
-	}
-	return -1
-}
-
-// extractTagAttr pulls the value of a named attribute from a raw HTML tag string.
-func extractTagAttr(tag, attr string) string {
-	// Try double-quoted: attr="value"
-	needle := attr + `="`
-	if idx := strings.Index(tag, needle); idx != -1 {
-		rest := tag[idx+len(needle):]
-		end := strings.Index(rest, `"`)
-		if end != -1 {
-			return rest[:end]
-		}
-	}
-	// Try single-quoted: attr='value'
-	needle = attr + `='`
-	if idx := strings.Index(tag, needle); idx != -1 {
-		rest := tag[idx+len(needle):]
-		end := strings.Index(rest, `'`)
-		if end != -1 {
-			return rest[:end]
-		}
-	}
-	return ""
-}
-
-func fixImageUrls(sections []string) []string {
-	var result []string
-	for _, section := range sections {
-		// Replace relative image paths with absolute URLs
-		updatedSection := fixRelativeImageUrls(section)
-		// Convert any inline <img> tags to markdown image syntax
-		updatedSection = fixHtmlImageTags(updatedSection)
-		result = append(result, updatedSection)
-	}
-	return result
-}
-
-// fixHtmlImageTags replaces <img> tags in content with markdown image syntax,
-// making relative src paths absolute.
-func fixHtmlImageTags(content string) string {
-	matches := extractHtmlImageTags(content)
-	// Process backwards so earlier offsets stay valid.
-	for i := len(matches) - 1; i >= 0; i-- {
-		m := matches[i]
-		src := m.src
-		if !strings.HasPrefix(src, "http") {
-			base := academyBase
-			if strings.HasPrefix(src, "/content/") {
-				base = cdnBase
-			}
-			src = base + src
-		}
-		mdImage := fmt.Sprintf("![%s](%s)", m.alt, src)
-		content = content[:m.tagStart] + mdImage + content[m.tagEnd:]
-	}
-	return content
-}
-
-func fixRelativeImageUrls(content string) string {
-	result := content
-
-	// Find all markdown images: ![alt](path) and make URLs absolute
-	searchPos := 0
-	for {
-		start := strings.Index(result[searchPos:], "![")
-		if start == -1 {
-			break
-		}
-		start += searchPos
-
-		// Find the closing ]
-		altEnd := strings.Index(result[start:], "](")
-		if altEnd == -1 {
-			break
-		}
-		altEnd += start
-
-		// Find the closing )
-		pathStart := altEnd + 2
-		pathEnd := strings.Index(result[pathStart:], ")")
-		if pathEnd == -1 {
-			break
-		}
-		pathEnd += pathStart
-
-		imagePath := result[pathStart:pathEnd]
-
-		// If path is relative, make it absolute.
-		// /content/ paths are served from the CDN, everything else from the academy host.
-		if !strings.HasPrefix(imagePath, "http") {
-			base := academyBase
-			if strings.HasPrefix(imagePath, "/content/") {
-				base = cdnBase
-			}
-			newPath := base + imagePath
-			result = result[:pathStart] + newPath + result[pathEnd:]
-			searchPos = pathStart + len(newPath)
-		} else {
-			searchPos = pathEnd + 1
-		}
+func downloadWalkthrough(module ModuleData, localImages bool, client *http.Client) ([]ImageRecord, error) {
+	if module.WalkthroughID == 0 {
+		return nil, nil
 	}
 
-	return result
-}
+	apiUrl := fmt.Sprintf("https://academy.hackthebox.com/api/v2/walkthroughs/%d", module.WalkthroughID)
 
-func getImagesLocally(sections []string, moduleID string) []string {
-	// Create images directory if it doesn't exist
-	imgDir := "images"
-	if err := os.MkdirAll(imgDir, 0755); err != nil {
-		die(err)
-	}
-
-	var result []string
-	imageCounter := 0
-
-	for _, section := range sections {
-		updatedSection, newCounter := replaceImagePathsInSectionWithCounter(section, moduleID, imageCounter)
-		imageCounter = newCounter
-		result = append(result, updatedSection)
-	}
-
-	return result
-}
-
-func replaceImagePathsInSectionWithCounter(content string, moduleID string, startCounter int) (string, int) {
-	imageCounter := startCounter
-	result := content
-
-	// Find all markdown images: ![alt](path)
-	// Process them from the end backwards to avoid offset issues
-	var imageMatches []struct {
-		start     int
-		altEnd    int
-		pathStart int
-		pathEnd   int
-		imagePath string
-	}
-
-	searchPos := 0
-	for {
-		start := strings.Index(result[searchPos:], "![")
-		if start == -1 {
-			break
-		}
-		start += searchPos
-
-		// Find the closing ]
-		altEnd := strings.Index(result[start:], "](")
-		if altEnd == -1 {
-			break
-		}
-		altEnd += start
-
-		// Find the closing )
-		pathStart := altEnd + 2
-		pathEnd := strings.Index(result[pathStart:], ")")
-		if pathEnd == -1 {
-			break
-		}
-		pathEnd += pathStart
-
-		imagePath := result[pathStart:pathEnd]
-
-		imageMatches = append(imageMatches, struct {
-			start     int
-			altEnd    int
-			pathStart int
-			pathEnd   int
-			imagePath string
-		}{start, altEnd, pathStart, pathEnd, imagePath})
-
-		searchPos = pathEnd + 1
-	}
-
-	// Process markdown images from the end backwards
-	for i := len(imageMatches) - 1; i >= 0; i-- {
-		match := imageMatches[i]
-		imagePath := match.imagePath
-
-		var newPath string
-		imageCounter++
-
-		fullUrl := imagePath
-		if !strings.HasPrefix(imagePath, "http") {
-			fullUrl = academyBase + imagePath
-		}
-
-		// Extract original filename from path
-		pathParts := strings.Split(imagePath, "/")
-		originalName := pathParts[len(pathParts)-1]
-
-		// Create a meaningful filename and download
-		newPath = downloadImageToFile(fullUrl, moduleID, imageCounter, originalName)
-
-		// Replace the image path in the result
-		result = result[:match.pathStart] + newPath + result[match.pathEnd:]
-	}
-
-	// Handle inline <img> tags. Extract, download, and replace with markdown syntax.
-	htmlMatches := extractHtmlImageTags(result)
-	for i := len(htmlMatches) - 1; i >= 0; i-- {
-		m := htmlMatches[i]
-		imageCounter++
-
-		fullUrl := m.src
-		if !strings.HasPrefix(m.src, "http") {
-			fullUrl = academyBase + m.src
-		}
-
-		pathParts := strings.Split(m.src, "/")
-		originalName := pathParts[len(pathParts)-1]
-
-		localPath := downloadImageToFile(fullUrl, moduleID, imageCounter, originalName)
-		mdImage := fmt.Sprintf("![%s](%s)", m.alt, localPath)
-		result = result[:m.tagStart] + mdImage + result[m.tagEnd:]
-	}
-
-	return result, imageCounter
-}
-
-// fetchImageBytes fetches an image from the given URL, falling back to the CDN
-// host for paths that return a non-200 response from the academy host.
-func fetchImageBytes(fileUrl string) ([]byte, string, error) {
-	resp, err := http.Get(fileUrl)
+	req, err := http.NewRequest("GET", apiUrl, nil)
 	if err != nil {
-		return nil, fileUrl, err
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Referer", fmt.Sprintf("https://academy.hackthebox.com/app/module/%d", module.ID))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// CDN fallback: if the academy host 404s, retry against the CDN.
-	if resp.StatusCode != 200 {
-		cdnUrl := cdnBase + strings.TrimPrefix(fileUrl, academyBase)
-		cdnResp, cdnErr := http.Get(cdnUrl)
-		if cdnErr != nil {
-			return nil, fileUrl, cdnErr
-		}
-		defer cdnResp.Body.Close()
-		if cdnResp.StatusCode != 200 {
-			return nil, fileUrl, fmt.Errorf("failed to fetch image from all available hosts (academy: %d, cdn: %d) for path: %s",
-				resp.StatusCode, cdnResp.StatusCode, strings.TrimPrefix(fileUrl, academyBase))
-		}
-		content, err := io.ReadAll(cdnResp.Body)
-		return content, cdnUrl, err
-	}
-
-	content, err := io.ReadAll(resp.Body)
-	return content, fileUrl, err
-}
-
-func downloadImageToFile(fileUrl string, moduleID string, counter int, originalName string) string {
-	// Create filename: images/module-{id}-{counter}-{original}.ext
-	ext := ""
-	if idx := strings.LastIndex(originalName, "."); idx != -1 {
-		ext = originalName[idx:]
-	}
-
-	fileName := fmt.Sprintf("images/module-%s-%03d%s", moduleID, counter, ext)
-
-	content, _, err := fetchImageBytes(fileUrl)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("Warning: Failed to download image %s: %v\n", fileUrl, err)
-		return fileUrl // Return original URL on failure
+		return nil, err
 	}
 
-	// If extension can't be determined from URL, detect from content
-	if ext == "" {
-		if isPNG(content) {
-			fileName = fileName + ".png"
-		} else if isJPEG(content) {
-			fileName = fileName + ".jpg"
-		} else if isGIF(content) {
-			fileName = fileName + ".gif"
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch walkthrough for module %d: status %d: %s", module.ID, resp.StatusCode, string(body))
+	}
+	var walkthroughResp WalkthroughResp
+	if err := json.Unmarshal(body, &walkthroughResp); err != nil {
+		return nil, err
+	}
+
+	moduleIDStr := fmt.Sprintf("%d", module.ID)
+	walkthroughFileName := walkthroughFilename(module.Name, moduleIDStr)
+
+	var imgRecords []ImageRecord
+	walkthroughInstructionsRaw := []string{walkthroughResp.Data.Instructions}
+	if localImages {
+		fmt.Println("Downloading walkthrough images...")
+		var perSection [][]ImageRecord
+		walkthroughInstructionsRaw, perSection = getImagesLocally(walkthroughInstructionsRaw, moduleIDStr+"-walkthrough", client)
+		if len(perSection) > 0 {
+			imgRecords = perSection[0]
 		}
+	} else {
+		walkthroughInstructionsRaw = fixImageUrls(walkthroughInstructionsRaw)
 	}
+	// this is just to cleanup the markdown a bit, it also removes the invalid `-session` that HTB appends to the fenced code blocks.
+	walkthroughInstructions := cleanMarkdown(walkthroughInstructionsRaw)
 
-	err = os.WriteFile(fileName, content, 0666)
-	if err != nil {
-		fmt.Printf("Warning: Failed to write image %s: %v\n", fileName, err)
-		return fileUrl
-	}
-
-	return fileName
-}
-
-func isPNG(b []byte) bool {
-	return len(b) >= 8 && string(b[0:8]) == "\x89PNG\r\n\x1a\n"
-}
-
-func isJPEG(b []byte) bool {
-	return len(b) >= 2 && string(b[0:2]) == "\xff\xd8"
-}
-
-func isGIF(data []byte) bool {
-	if len(data) < 6 {
-		return false
-	}
-	if string(data[:3]) != "GIF" {
-		return false
-	}
-	if string(data[3:6]) != "87a" && string(data[3:6]) != "89a" {
-		return false
-	}
-	return true
+	return imgRecords, os.WriteFile(filepath.Join(BASE_FOLDER, walkthroughFileName), []byte(walkthroughInstructions), 0666)
 }
 
 func die(err error) {
