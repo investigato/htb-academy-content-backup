@@ -27,7 +27,7 @@ func saveTracker(data TrackerData) error {
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, "tracker.json") // atomic on same FS
+	return os.Rename(tmp, "tracker.json") // do or do not, there is no try
 }
 
 func isModuleDownloaded(moduleID int, tracker TrackerData) bool {
