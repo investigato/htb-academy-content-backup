@@ -3,6 +3,15 @@ This is a simple CLI application that will fetch and convert a HackTheBox Academ
 This program will only grab one module at a time, and requires authenticating with the platform. 
 You will also need to have the module unlocked, which should go without saying.
 
+**Changes as of 3/17/2026**
+
+- Added ability to download all of your available modules. Run without the `-m ...` setting.
+- Added caching of available modules to avoid multiple downloads of the same content.
+- Saving images locally and downloading of walkthroughs/solutions are **ON** by default.
+- Added tracking of individual modules, sections, and images.
+- Added retry on failed images.
+- Switched to `goldmark` markdown parser to get as CommonMark compliant as possible.
+
 **Updated for HTB Academy 2.0** - This tool has been updated to work with the latest HTB Academy platform using the new API endpoints.
 
 I personally use [Obsidian](https://obsidian.md/) as my note-taking tool, and this application is tailored and tested for rendering markdown utilizing it.
