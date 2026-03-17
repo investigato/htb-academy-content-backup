@@ -1,6 +1,7 @@
 .idea
 dist
 .ds_store
-.vscode
+.vscode/*
+settings.json
 *.log
 *.tmp
