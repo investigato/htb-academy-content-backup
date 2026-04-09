@@ -5,3 +5,8 @@ dist
 settings.json
 *.log
 *.tmp
+modules/*
+tracker.json
+.vscode/*
+.vscode/settings.json
+.obsidian/*

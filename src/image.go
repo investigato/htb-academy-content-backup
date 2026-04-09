@@ -267,11 +267,11 @@ func writeImage(data []byte, moduleID string, counter int) (string, string, erro
 	if err != nil {
 		return "", "", err
 	}
-	path := fmt.Sprintf("%s/images/module-%s-%03d%s", BASE_FOLDER, moduleID, counter, ext)
+	path := fmt.Sprintf("modules/images/module-%s-%03d%s", moduleID, counter, ext)
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return "", "", fmt.Errorf("write %s: %w", path, err)
 	}
-	return path, strings.TrimPrefix(ext, "."), nil
+	return strings.TrimPrefix(path, "modules/"), strings.TrimPrefix(ext, "."), nil
 }
 
 func processImages(sections []string, moduleID string, download bool, client *http.Client) ([]string, [][]ImageRecord) {

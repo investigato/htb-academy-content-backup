@@ -18,7 +18,6 @@ import (
 const cdnBase = "https://cdn.services-k8s.prod.aws.htb.systems"
 const academyBase = "https://academy.hackthebox.com"
 
-
 func (ua *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", ua.UserAgent)
@@ -54,7 +53,10 @@ func createHttpClient(options Args) *http.Client {
 func addCookiesToJar(jar *cookiejar.Jar, cookies string) {
 	cookiePairs := strings.Split(cookies, ";")
 	cookieList := []*http.Cookie{}
-
+	// if idiots like me just paste the htb_academy_session cookie VALUE, add htb_academy_session= to the front so it gets parsed correctly.
+	if len(cookiePairs) == 1 && !strings.Contains(cookiePairs[0], "=") {
+		cookiePairs[0] = "htb_academy_session=" + cookiePairs[0]
+	}
 	for _, pair := range cookiePairs {
 		parts := strings.SplitN(pair, "=", 2)
 		if len(parts) == 2 {
