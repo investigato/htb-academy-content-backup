@@ -88,18 +88,9 @@ func authenticate(options Args) *http.Client {
 }
 
 func getAllAvailableModules(client *http.Client, tracker *TrackerData) []ModuleData {
-	// Use cached list if available
-	if len(tracker.ModulesAvailable) > 0 {
-		fmt.Printf("Using cached list of %d available modules from tracker.\n", len(tracker.ModulesAvailable))
-		var modules []ModuleData
-		for _, module := range tracker.ModulesAvailable {
-			modules = append(modules, module)
-		}
-		return modules
-	}
-
 	apiUrl := "https://academy.hackthebox.com/api/v2/modules"
 	stateValues := []string{"owned", "in_progress"}
+	seen := make(map[int]bool)
 	var allModules []ModuleData
 
 	for _, state := range stateValues {
@@ -127,20 +118,24 @@ func getAllAvailableModules(client *http.Client, tracker *TrackerData) []ModuleD
 			os.Exit(1)
 		}
 
-		var modulesResp ModuleReponseArray
+		var modulesResp ModuleResponseArray
 		if err := json.Unmarshal(body, &modulesResp); err != nil {
 			die(err)
 		}
 
 		for _, module := range modulesResp.Data {
-			allModules = append(allModules, module)
-			tracker.ModulesAvailable = append(tracker.ModulesAvailable, module)
+			if !seen[module.ID] {
+				seen[module.ID] = true
+				allModules = append(allModules, module)
+			}
 		}
 	}
 
-	// Cache the fetched list
+	// Replace cached list with current API state so new modules appear on next run
+	tracker.ModulesAvailable = allModules
 	saveTracker(*tracker)
 
+	fmt.Printf("Found %d available modules.\n", len(allModules))
 	return allModules
 }
 

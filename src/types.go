@@ -29,7 +29,7 @@ type ModuleResponse struct {
 	Data ModuleData `json:"data"`
 }
 
-type ModuleReponseArray struct {
+type ModuleResponseArray struct {
 	Data []ModuleData `json:"data"`
 }
 

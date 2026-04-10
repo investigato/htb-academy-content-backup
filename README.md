@@ -3,6 +3,11 @@ This is a simple CLI application that will fetch and convert a HackTheBox Academ
 This program will only grab one module at a time, and requires authenticating with the platform. 
 You will also need to have the module unlocked, which should go without saying.
 
+**Changes as of 4/10/2026**
+
+- Typo corrected in `ModuleResponseArray` (was `ModuleReponseArray`)
+- Cache is properly tracked and updated with new modules.
+
 **Changes as of 4/9/2026**
 
 - Cookie can be without `htb_academy_session=` part now.
